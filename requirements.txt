@@ -9,3 +9,4 @@ protobuf
 Werkzeug
 flask
 pyTelegramBotAPI
+telebot
