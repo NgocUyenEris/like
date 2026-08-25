@@ -1,31 +1,33 @@
 from flask import Flask, request, jsonify
-import asyncio
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
+from google.protobuf.message import DecodeError
 import binascii
-import aiohttp
 import requests
 import json
+import os
 import like_pb2
 import like_count_pb2
 import uid_generator_pb2
-from google.protobuf.message import DecodeError
+import urllib3
+
+# Tắt cảnh báo SSL không an toàn
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
 def load_tokens(server_name):
     try:
-        if server_name == "VN":
-            with open("token_vn.json", "r") as f:
+        filename = f"token_{server_name.lower()}.json"
+        if not os.path.exists(filename):
+            filename = "token_vn.json"
+            
+        if os.path.exists(filename):
+            with open(filename, "r", encoding="utf-8") as f:
                 tokens = json.load(f)
-        elif server_name in {"VN", "VN", "VN", "VN"}:
-            with open("token_vn.json", "r") as f:
-                tokens = json.load(f)
-        else:
-            with open("token_vn.json", "r") as f:
-                tokens = json.load(f)
-        return tokens
+            return tokens
+        return None
     except Exception as e:
         app.logger.error(f"Error loading tokens for server {server_name}: {e}")
         return None
@@ -34,6 +36,193 @@ def encrypt_message(plaintext):
     try:
         key = b'Yg&tc%DEuh6%Zc^8'
         iv = b'6oyZDr22E3ychjM%'
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        padded_message = pad(plaintext, AES.block_size)
+        encrypted_message = cipher.encrypt(padded_message)
+        return binascii.hexlify(encrypted_message).decode('utf-8')
+    except Exception as e:
+        app.logger.error(f"Error encrypting message: {e}")
+        return None
+
+def create_protobuf_message(user_id, region):
+    try:
+        message = like_pb2.like()
+        message.uid = int(user_id)
+        message.region = region
+        if hasattr(message, 'ob_version'):
+            message.ob_version = "OB48"
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating protobuf message: {e}")
+        return None
+
+def send_single_request(encrypted_uid, token, url):
+    """Gửi request đồng bộ thay vì dùng aiohttp/asyncio để tương thích tuyệt đối với Vercel Serverless."""
+    try:
+        edata = bytes.fromhex(encrypted_uid)
+        headers = {
+            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
+            'Authorization': f"Bearer {token}",
+            'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
+            'ReleaseVersion': "OB50"
+        }
+        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=5)
+        if response.status_code != 200:
+            return None
+        return response.text
+    except Exception as e:
+        return None
+
+def create_protobuf(uid):
+    try:
+        message = uid_generator_pb2.uid_generator()
+        message.saturn_ = int(uid)
+        message.garena = 1
+ 
+        if hasattr(message, 'ob_version'):
+            message.ob_version = "OB48"
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating uid protobuf: {e}")
+        return None
+
+def enc(uid):
+    protobuf_data = create_protobuf(uid)
+    if protobuf_data is None:
+        return None
+    encrypted_uid = encrypt_message(protobuf_data)
+    return encrypted_uid
+
+def decode_protobuf(binary):
+    try:
+        items = like_count_pb2.Info()
+        items.ParseFromString(binary)
+        return items
+    except DecodeError as e:
+        app.logger.error(f"Error decoding Protobuf data: {e}")
+        return None
+    except Exception as e:
+        app.logger.error(f"Unexpected error during protobuf decoding: {e}")
+        return None
+
+def make_request(encrypt, server_name, token):
+    try:
+        url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
+        edata = bytes.fromhex(encrypt)
+        headers = {
+            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
+            'Authorization': f"Bearer {token}",
+            'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
+            'ReleaseVersion': "OB50"
+        }
+        response = requests.post(url, data=edata, headers=headers, verify=False, timeout=5)
+        if response.status_code != 200:
+            app.logger.error(f"Request failed with status code: {response.status_code}")
+            return None
+        binary = response.content
+        decode = decode_protobuf(binary)
+        return decode
+    except Exception as e:
+        app.logger.error(f"Error in make_request: {e}")
+        return None
+
+@app.route('/reload-tokens', methods=['GET', 'POST'])
+def reload_tokens():
+    return jsonify({
+        "status": "info",
+        "message": "Vercel chạy ở chế độ Read-only. Hãy cập nhật file token_vn.json trực tiếp lên GitHub rồi Redeploy."
+    }), 200
+
+@app.route('/like', methods=['GET'])
+def handle_requests():
+    uid = request.args.get("uid")
+    server_name = request.args.get("server_name", "").upper()
+    if not uid or not server_name:
+        return jsonify({"error": "UID and server_name are required"}), 400
+
+    try:
+        tokens = load_tokens(server_name)
+        if tokens is None:
+            return jsonify({"error": "Failed to load tokens."}), 500
+            
+        token = tokens[0]['token']
+        encrypted_uid = enc(uid)
+        if encrypted_uid is None:
+            return jsonify({"error": "Encryption of UID failed."}), 500
+
+        before = make_request(encrypted_uid, server_name, token)
+        if before is None:
+            return jsonify({"error": "Failed to retrieve initial player info."}), 500
+            
+        try:
+            jsone = MessageToJson(before)
+        except Exception as e:
+            return jsonify({"error": f"Error converting 'before' protobuf to JSON: {e}"}), 500
+            
+        data_before = json.loads(jsone)
+        before_like = data_before.get('AccountInfo', {}).get('Likes', 0)
+        try:
+            before_like = int(before_like)
+        except Exception:
+            before_like = 0
+
+        url = "https://clientbp.ggpolarbear.com/LikeProfile"
+        
+        protobuf_message = create_protobuf_message(uid, server_name)
+        if protobuf_message:
+            enc_uid_like = encrypt_message(protobuf_message)
+            if enc_uid_like:
+                # Gửi tối đa 50 request qua vòng lặp tuần tự an toàn
+                for i in range(min(50, len(tokens))):
+                    t = tokens[i % len(tokens)]["token"]
+                    send_single_request(enc_uid_like, t, url)
+
+        after = make_request(encrypted_uid, server_name, token)
+        if after is None:
+            return jsonify({"error": "Failed to retrieve player info after like requests."}), 500
+            
+        try:
+            jsone_after = MessageToJson(after)
+        except Exception as e:
+            return jsonify({"error": f"Error converting 'after' protobuf to JSON: {e}"}), 500
+            
+        data_after = json.loads(jsone_after)
+        after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
+        player_uid = int(data_after.get('AccountInfo', {}).get('UID', 0))
+        player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
+        like_given = after_like - before_like
+        status = 1 if like_given != 0 else 2
+        
+        result = {
+            "LikesGivenByAPI": like_given,
+            "LikesafterCommand": after_like,
+            "LikesbeforeCommand": before_like,
+            "PlayerNickname": player_name,
+            "UID": player_uid,
+            "status": status
+        }
+        return jsonify(result)
+        
+    except Exception as e:
+        app.logger.error(f"Error processing request: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/')
+def home():
+    return "API Buff Like Free Fire is running on Vercel!"
+
+if __name__ == '__main__':
+    app.run(debug=True, use_reloader=False)
         cipher = AES.new(key, AES.MODE_CBC, iv)
         padded_message = pad(plaintext, AES.block_size)
         encrypted_message = cipher.encrypt(padded_message)
