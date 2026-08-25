@@ -4,44 +4,38 @@
 # DONT CHANGE CREDIT 
 
 from flask import Flask, request, jsonify
-import ssl
-import time
-import os
-import aiohttp
+import asyncio
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
 import binascii
+import aiohttp
 import requests
 import json
 import like_pb2
 import like_count_pb2
 import uid_generator_pb2
+from google.protobuf.message import DecodeError
 import urllib3
-from datetime import datetime
 
 # Tắt cảnh báo SSL không an toàn
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
-# ==========================================
-# HỆ THỐNG XỬ LÝ TOKEN & GỌI API CHO VERCEL
-# ==========================================
-
 def load_tokens(server_name):
-    """Tải danh sách token dựa theo tên server từ file JSON có sẵn (An toàn trên Vercel Read-only)."""
+    """Tải danh sách token dựa theo tên server."""
     try:
         filename = f"token_{server_name.lower()}.json"
-        if not os.path.exists(filename):
-            filename = "token_vn.json"
-            
-        if os.path.exists(filename):
-            with open(filename, "r", encoding="utf-8") as f:
+        try:
+            with open(filename, "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            with open("token_vn.json", "r") as f:
                 return json.load(f)
     except Exception as e:
         app.logger.error(f"Error loading tokens for server {server_name}: {e}")
-    return None
+        return None
 
 def encrypt_message(plaintext):
     """Mã hóa AES CBC cho chuỗi byte protobuf."""
@@ -59,6 +53,211 @@ def encrypt_message(plaintext):
 def create_protobuf_message(user_id, region):
     """Tạo protobuf message cho chức năng Like."""
     try:
+        message = like_pb2.like()
+        message.uid = int(user_id)
+        message.region = region
+        if hasattr(message, 'ob_version'):
+            message.ob_version = "OB50" # Đã sửa đồng bộ thành OB50
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating like protobuf message: {e}")
+        return None
+
+async def send_request(encrypted_uid, token, url):
+    """Gửi bất đồng bộ yêu cầu Like tới server."""
+    try:
+        edata = bytes.fromhex(encrypted_uid)
+        headers = {
+            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
+            'Authorization': f"Bearer {token}",
+            'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
+            'ReleaseVersion': "OB50"
+        }
+        async with aiohttp.ClientSession() as session:
+            # Thêm ssl=False để tránh lỗi SSL bất đồng bộ
+            async with session.post(url, data=edata, headers=headers, ssl=False) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    app.logger.error(f"Request failed with status code: {response.status} and response: {text}")
+                    return None
+                return await response.text()
+    except Exception as e:
+        app.logger.error(f"Exception in send_request: {e}")
+        return None
+
+async def send_multiple_requests(uid, server_name, url):
+    """Gửi hàng loạt yêu cầu tăng like đồng thời."""
+    try:
+        region = server_name
+        protobuf_message = create_protobuf_message(uid, region)
+        if protobuf_message is None:
+            app.logger.error("Failed to create protobuf message.")
+            return None
+        encrypted_uid = encrypt_message(protobuf_message)
+        if encrypted_uid is None:
+            app.logger.error("Encryption failed.")
+            return None
+        
+        tokens = load_tokens(server_name)
+        if not tokens:
+            app.logger.error("Failed to load tokens or token list is empty.")
+            return None
+            
+        tasks = []
+        for i in range(100):
+            token = tokens[i % len(tokens)]["token"]
+            tasks.append(send_request(encrypted_uid, token, url))
+            
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    except Exception as e:
+        app.logger.error(f"Exception in send_multiple_requests: {e}")
+        return None
+
+def create_protobuf(uid):
+    """Tạo protobuf message chứa UID để lấy thông tin player."""
+    try:
+        message = uid_generator_pb2.uid_generator()
+        message.krishna_ = int(uid)  
+        message.teamXdarks = 1       
+        if hasattr(message, 'ob_version'):
+            message.ob_version = "OB50" # Đã sửa đồng bộ thành OB50
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating uid protobuf: {e}")
+        return None
+
+def enc(uid):
+    """Đóng gói và mã hóa UID."""
+    protobuf_data = create_protobuf(uid)
+    if protobuf_data is None:
+        app.logger.error("create_protobuf returned None")
+        return None
+    encrypted_uid = encrypt_message(protobuf_data)
+    if encrypted_uid is None:
+        app.logger.error("encrypt_message returned None")
+    return encrypted_uid
+
+def decode_protobuf(binary):
+    """Giải mã dữ liệu phản hồi từ server dạng Protobuf."""
+    try:
+        items = like_count_pb2.Info()
+        items.ParseFromString(binary)
+        return items
+    except DecodeError as e:
+        app.logger.error(f"Error decoding Protobuf data: {e}")
+        return None
+    except Exception as e:
+        app.logger.error(f"Unexpected error during protobuf decoding: {e}")
+        return None
+
+def make_request(encrypt, server_name, token):
+    """Gửi yêu cầu lấy thông tin cá nhân của người chơi."""
+    try:
+        url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
+        edata = bytes.fromhex(encrypt)
+        headers = {
+            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
+            'Authorization': f"Bearer {token}",
+            'Content-Type': "application/x-www-form-urlencoded",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
+            'ReleaseVersion': "OB50"
+        }
+        response = requests.post(url, data=edata, headers=headers, verify=False)
+        
+        # ĐÃ THÊM LOG ĐỂ BẮT LỖI TỪ GARENA VÀ IN RA MÀN HÌNH
+        if response.status_code != 200:
+            app.logger.error(f"HTTP Lỗi {response.status_code}: {response.text}")
+            print(f"[-] LỖI TỪ SERVER GARENA: HTTP {response.status_code} - {response.text}")
+            return None
+            
+        decoded = decode_protobuf(response.content)
+        if decoded is None:
+            print("[-] LỖI GIẢI MÃ PROTOBUF: Dữ liệu trả về không đúng định dạng. Cần check lại version OB hoặc file proto.")
+        return decoded
+    except Exception as e:
+        app.logger.error(f"Error in make_request: {e}")
+        return None
+
+@app.route('/like', methods=['GET'])
+def handle_requests():
+    uid = request.args.get("uid")
+    server_name = request.args.get("server_name", "").upper()
+    
+    if not uid or not server_name:
+        return jsonify({"error": "UID and server_name are required"}), 400
+
+    try:
+        def process_request():
+            tokens = load_tokens(server_name)
+            if not tokens:
+                raise Exception("Failed to load tokens. File token_vn.json trống hoặc không tồn tại.")
+                
+            token = tokens[0]['token']
+            encrypted_uid = enc(uid)
+            if encrypted_uid is None:
+                raise Exception("Mã hóa UID thất bại. Vui lòng kiểm tra file proto.")
+
+            # Lấy thông tin lượt like trước khi thực hiện
+            before = make_request(encrypted_uid, server_name, token)
+            if before is None:
+                raise Exception("Không thể truy xuất thông tin người chơi ban đầu. Vui lòng xem màn hình Terminal để biết lỗi từ Garena (thường do Token chết hoặc sai bản OB).")
+                
+            jsone = MessageToJson(before)
+            data_before = json.loads(jsone)
+            before_like = int(data_before.get('AccountInfo', {}).get('Likes', 0))
+            app.logger.info(f"Likes before command: {before_like}")
+
+            # URL thực hiện bắn Like
+            url = "https://clientbp.ggpolarbear.com/LikeProfile"
+
+            # Tiến hành gửi request tăng like bất đồng bộ
+            asyncio.run(send_multiple_requests(uid, server_name, url))
+
+            # Lấy thông tin lượt like sau khi hoàn tất
+            after = make_request(encrypted_uid, server_name, token)
+            if after is None:
+                raise Exception("Không thể lấy thông tin người chơi sau khi Like.")
+                
+            jsone_after = MessageToJson(after)
+            data_after = json.loads(jsone_after)
+            
+            account_info = data_after.get('AccountInfo', {})
+            after_like = int(account_info.get('Likes', 0))
+            player_uid = int(account_info.get('UID', 0))
+            player_name = str(account_info.get('PlayerNickname', ''))
+            
+            like_given = after_like - before_like
+            status = 1 if like_given != 0 else 2
+            
+            return {
+                "LikesGivenByAPI": like_given,
+                "LikesafterCommand": after_like,
+                "LikesbeforeCommand": before_like,
+                "PlayerNickname": player_name,
+                "UID": player_uid,
+                "status": status
+            }
+
+        result = process_request()
+        return jsonify(result)
+    except Exception as e:
+        app.logger.error(f"Error processing request: {e}")
+        return jsonify({"Lỗi": str(e)}), 500
+
+if __name__ == '__main__':
+    print("🚀 Đang khởi động API Buff Like Free Fire...")
+    print("💡 Lưu ý: Nếu gặp lỗi truy xuất thông tin, hãy gửi file token.json mới vào Bot để cập nhật!")
+    app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
         message = like_pb2.like()
         message.uid = int(user_id)
         message.region = region
